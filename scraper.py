@@ -6,7 +6,9 @@ import os
 import re
 
 from playwright.async_api import async_playwright, Page, Browser
+from dotenv import load_dotenv
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 BB_URL = os.getenv("BLACKBOARD_URL", "https://elearn.mu-varna.bg")
@@ -33,30 +35,37 @@ class BlackboardSession:
         if self.browser:
             await self.browser.close()
 
-    async def _login(self):
-        """Login to Blackboard."""
-        await self.page.goto(BB_URL, timeout=30000)
-
-        # Close privacy dialog
+    async def _login(self, retry=0):
+        """Login to Blackboard with retry."""
+        if retry > 2:
+            raise Exception("Login failed after 3 attempts")
         try:
-            ok_btn = self.page.locator('text="OK"').first
-            if await ok_btn.is_visible(timeout=3000):
-                await ok_btn.click(force=True)
-                await self.page.wait_for_timeout(1000)
-        except Exception:
-            pass
+            await self.page.goto(BB_URL, timeout=60000, wait_until="domcontentloaded")
 
-        # Fill login form
-        await self.page.fill('input#user_id', BB_USER)
-        await self.page.fill('input#password', BB_PASS)
-        await self.page.click('input[type="submit"]')
+            # Close privacy dialog
+            try:
+                ok_btn = self.page.locator('text="OK"').first
+                if await ok_btn.is_visible(timeout=5000):
+                    await ok_btn.click(force=True)
+                    await self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
 
-        # Wait for redirect
-        await self.page.wait_for_url('**/ultra/**', timeout=15000)
-        await self.page.wait_for_timeout(3000)
+            # Fill login form
+            await self.page.fill('input#user_id', BB_USER, timeout=10000)
+            await self.page.fill('input#password', BB_PASS, timeout=10000)
+            await self.page.click('input[type="submit"]')
 
-        self.logged_in = True
-        logger.info(f"Logged in to Blackboard as {BB_USER}")
+            # Wait for redirect
+            await self.page.wait_for_url('**/ultra/**', timeout=30000)
+            await self.page.wait_for_timeout(3000)
+
+            self.logged_in = True
+            logger.info(f"Logged in to Blackboard as {BB_USER}")
+        except Exception as e:
+            logger.warning(f"Login attempt {retry+1} failed: {e}")
+            await self.page.wait_for_timeout(5000)
+            await self._login(retry + 1)
 
     async def get_courses(self) -> list[dict]:
         """Get list of all courses."""
@@ -251,3 +260,19 @@ class BlackboardSession:
     async def screenshot(self) -> bytes:
         """Take screenshot of current page."""
         return await self.page.screenshot(type='jpeg', quality=85)
+
+
+    async def ensure_logged_in(self):
+        """Re-login if session expired."""
+        try:
+            # Try navigating to courses to check if still logged in
+            await self.page.goto(f'{BB_URL}/ultra/course', timeout=10000)
+            await self.page.wait_for_timeout(2000)
+            if 'login' in self.page.url.lower() or 'auth' in self.page.url.lower():
+                logger.info("Session expired, re-logging in...")
+                self.logged_in = False
+                await self._login()
+        except Exception as e:
+            logger.warning(f"Session check failed: {e}")
+            self.logged_in = False
+            await self._login()

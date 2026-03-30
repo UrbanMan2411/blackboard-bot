@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import defaultdict
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,10 +28,13 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
 NOTIFY_CHAT_ID = None  # Set on first /start
 
 # State
+import asyncio as _asyncio
+bb_lock = _asyncio.Lock()
 bb_session: BlackboardSession | None = None
-known_assignments: dict[str, dict] = {}  # course_name -> {assignment_name -> data}
+known_assignments: dict[str, dict] = {}
 pending_assignments: list[dict] = []
 active_test: dict | None = None
+test_history: list[dict] = []  # {course, assignment, score, attempts, time}
 
 
 router = Router()
@@ -57,7 +61,8 @@ async def cmd_start(message: Message):
 async def cmd_check(message: Message):
     await message.answer("🔍 Проверяю курсы на новые задания...")
     try:
-        if not bb_session:
+        # Ensure session is alive
+        if not bb_session or not bb_session.logged_in:
             await message.answer("⏳ Подключаюсь к Blackboard...")
             await init_session()
 
@@ -101,7 +106,8 @@ async def cmd_check(message: Message):
 @router.message(Command("courses"))
 async def cmd_courses(message: Message):
     try:
-        if not bb_session:
+        # Ensure session is alive
+        if not bb_session or not bb_session.logged_in:
             await init_session()
         courses = await bb_session.get_courses()
         text = "📚 <b>Курсы:</b>\n\n"
@@ -134,16 +140,33 @@ async def cmd_status(message: Message):
         f"Известных заданий: {len(known_assignments)}\n"
         f"Ожидающих: {len(pending_assignments)}\n"
         f"Активный тест: {'Да' if active_test else 'Нет'}\n"
-        f"Мин. балл: {MIN_SCORE}%"
+        f"Мин. балл: {MIN_SCORE}%\n"
+        f"История: {len(test_history)} тестов"
     )
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("history"))
+async def cmd_history(message: Message):
+    if not test_history:
+        await message.answer("История пуста.")
+        return
+    text = "<b>📋 История тестов:</b>\n\n"
+    for i, item in enumerate(reversed(test_history[-10:]), 1):
+        t = item['time'].strftime("%d.%m %H:%M")
+        status = "✅" if item['status'] == 'passed' else "❌"
+        text += f"{i}. {status} {item['score']:.0f}% — {item['assignment'][:40]}\n   📖 {item['course'][:30]} • {item['attempts']} поп. • {t}\n\n"
     await message.answer(text, parse_mode="HTML")
 
 
 async def init_session():
     """Initialize Blackboard session."""
     global bb_session
-    bb_session = BlackboardSession()
-    await bb_session.start()
+    async with bb_lock:
+        if bb_session and bb_session.logged_in:
+            return
+        bb_session = BlackboardSession()
+        await bb_session.start()
 
 
 # === Callbacks ===
@@ -188,8 +211,17 @@ async def cb_do_all(callback: CallbackQuery):
         # Submit test
         result = await bb_session.submit_test()
         score = result.get('percent', 0)
+        attempts = 1
 
         if score >= MIN_SCORE:
+            test_history.append({
+                'course': assignment['course'],
+                'assignment': assignment['assignment'],
+                'score': score,
+                'attempts': attempts,
+                'time': datetime.now(),
+                'status': 'passed',
+            })
             await callback.message.answer(
                 f"✅ <b>Тест сдан!</b>\n\n"
                 f"📊 Результат: {score:.0f}%\n"
@@ -203,9 +235,9 @@ async def cb_do_all(callback: CallbackQuery):
                 f"Пересдаю...",
                 parse_mode="HTML",
             )
-            # Recursive retry (max 3 times)
             for attempt in range(3):
-                await callback.message.answer(f"🔄 Попытка {attempt + 2}/4...")
+                attempts = attempt + 2
+                await callback.message.answer(f"🔄 Попытка {attempts}/4...")
                 result = await bb_session.start_assignment(assignment.get('url', ''))
                 questions = result.get('questions', [])
                 if not questions:
@@ -217,12 +249,28 @@ async def cb_do_all(callback: CallbackQuery):
                 result = await bb_session.submit_test()
                 score = result.get('percent', 0)
                 if score >= MIN_SCORE:
+                    test_history.append({
+                        'course': assignment['course'],
+                        'assignment': assignment['assignment'],
+                        'score': score,
+                        'attempts': attempts,
+                        'time': datetime.now(),
+                        'status': 'passed',
+                    })
                     await callback.message.answer(
-                        f"✅ <b>Тест сдан!</b>\n\n📊 Результат: {score:.0f}%",
+                        f"✅ <b>Тест сдан!</b>\n\n📊 Результат: {score:.0f}%\n🔄 Попыток: {attempts}",
                         parse_mode="HTML",
                     )
                     break
             else:
+                test_history.append({
+                    'course': assignment['course'],
+                    'assignment': assignment['assignment'],
+                    'score': score,
+                    'attempts': 4,
+                    'time': datetime.now(),
+                    'status': 'failed',
+                })
                 await callback.message.answer(
                     f"❌ Не удалось набрать {MIN_SCORE}% за 4 попытки.\n"
                     f"Последний результат: {score:.0f}%"
@@ -230,7 +278,7 @@ async def cb_do_all(callback: CallbackQuery):
 
     except Exception as e:
         logger.error(f"Do all error: {e}", exc_info=True)
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await callback.message.answer(f"❌ Ошибка: {e}\n\nПопробуй /check снова.")
 
 
 @router.callback_query(F.data == "show_details")

@@ -57,7 +57,11 @@ class BlackboardSession:
             await self.page.click('input[type="submit"]')
 
             # Wait for redirect
-            await self.page.wait_for_url('**/ultra/**', timeout=30000)
+            try:
+                await self.page.wait_for_url('**/ultra/**', timeout=30000)
+            except Exception:
+                # Maybe already redirected or different URL pattern
+                await self.page.wait_for_timeout(5000)
             await self.page.wait_for_timeout(3000)
 
             self.logged_in = True
@@ -72,29 +76,46 @@ class BlackboardSession:
         if not self.logged_in:
             await self._login()
 
-        await self.page.goto(f'{BB_URL}/ultra/course', timeout=30000)
-        await self.page.wait_for_timeout(3000)
+        await self.page.goto(f'{BB_URL}/ultra/course', timeout=60000, wait_until='domcontentloaded')
+        await self.page.wait_for_timeout(5000)
 
         courses = []
-        # Find course cards
-        cards = await self.page.query_selector_all('[class*="course-card"], [data-course-id], a[href*="course"]')
-        
-        # Alternative: parse text
-        text = await self.page.inner_text('body')
-        lines = text.split('\n')
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line.startswith('Открыть') or 'ultra' in line.lower():
-                continue
-            if len(line) > 5 and not line.startswith('http') and not line.startswith('©'):
-                # Check if next line has "Открыть"
-                if i + 1 < len(lines) and 'Открыть' in lines[i + 1]:
-                    courses.append({
-                        'name': line,
-                        'index': len(courses),
-                    })
+        # Try to find course elements by various selectors
+        selectors = [
+            '[data-course-id]',
+            '.course-card',
+            'li[class*="course"]',
+            'a[href*="/ultra/course/"]',
+        ]
 
+        for sel in selectors:
+            elements = await self.page.query_selector_all(sel)
+            if elements:
+                for el in elements:
+                    text = await el.inner_text()
+                    lines = [l.strip() for l in text.split('\n') if l.strip() and len(l.strip()) > 3]
+                    if lines:
+                        courses.append({
+                            'name': lines[0][:100],
+                            'index': len(courses),
+                            'selector': sel,
+                        })
+                break
+
+        # Fallback: parse text
+        if not courses:
+            text = await self.page.inner_text('body')
+            lines = text.split('\n')
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if len(line) > 5 and 'Открыть' not in line and 'ultra' not in line.lower() and not line.startswith('©'):
+                    if i + 1 < len(lines) and 'Открыть' in lines[i + 1]:
+                        courses.append({
+                            'name': line[:100],
+                            'index': len(courses),
+                        })
+
+        logger.info(f"Found {len(courses)} courses")
         return courses
 
     async def get_course_assignments(self, course_index: int) -> list[dict]:
